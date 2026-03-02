@@ -1,9 +1,9 @@
 # Changelog
 
 
-## 1.0.21 (unreleased)
+## 1.0.21
 
-*In development* - **Long Context Chunking**
+**Long Context Chunking**
 
 - **Feats**: Added automatic chunking for documents exceeding embedding context limits
 - **Feats**: Smart semantic-aware chunking at sentence boundaries with configurable overlap

@@ -154,6 +154,8 @@ const DEFAULT_REFLECTION_DEDUPE_ERROR_SIGNALS = true;
 const DEFAULT_REFLECTION_SESSION_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS = 200;
 const DEFAULT_REFLECTION_ERROR_SCAN_MAX_CHARS = 8_000;
+const DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS = 2 * 60 * 60 * 1000;
+const REFLECTION_FALLBACK_MARKER = "(fallback) Reflection generation failed; storing minimal pointer only.";
 
 type ReflectionErrorSignal = {
   at: number;
@@ -437,7 +439,7 @@ function buildReflectionPrompt(
 function buildReflectionFallbackText(): string {
   return [
     "## Context",
-    "- (fallback) Reflection generation failed; storing minimal pointer only.",
+    `- ${REFLECTION_FALLBACK_MARKER}`,
     "",
     "## Decisions (durable)",
     "- (none captured)",
@@ -475,7 +477,7 @@ async function generateReflectionText(params: {
   timeoutMs: number;
   thinkLevel: ReflectionThinkLevel;
   toolErrorSignals?: ReflectionErrorSignal[];
-}): Promise<{ text: string; usedFallback: boolean; promptHash: string }> {
+}): Promise<{ text: string; usedFallback: boolean; promptHash: string; error?: string }> {
   const prompt = buildReflectionPrompt(
     params.conversation,
     params.maxInputChars,
@@ -487,6 +489,7 @@ async function generateReflectionText(params: {
     `memory-reflection-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`
   );
   let reflectionText: string | null = null;
+  let reflectionError: string | undefined;
 
   try {
     const { runEmbeddedPiAgent } = await import("file:///usr/lib/node_modules/openclaw/dist/extensionAPI.js");
@@ -510,14 +513,14 @@ async function generateReflectionText(params: {
       const firstWithText = result.payloads.find((p: any) => p && typeof p.text === "string" && p.text.trim().length);
       reflectionText = typeof firstWithText?.text === "string" ? firstWithText.text.trim() : null;
     }
-  } catch {
-    // fallback below
+  } catch (err) {
+    reflectionError = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
   } finally {
     await unlink(tempSessionFile).catch(() => { });
   }
 
   if (reflectionText) return { text: reflectionText, usedFallback: false, promptHash };
-  return { text: buildReflectionFallbackText(), usedFallback: true, promptHash };
+  return { text: buildReflectionFallbackText(), usedFallback: true, promptHash, error: reflectionError };
 }
 
 // ============================================================================
@@ -861,6 +864,20 @@ const memoryLanceDBProPlugin = {
     };
 
     const extractReflectionSlices = (reflectionText: string): { invariants: string[]; derived: string[] } => {
+      const isPlaceholderSlice = (line: string): boolean => {
+        const normalized = line.replace(/\*\*/g, "").trim();
+        if (!normalized) return true;
+        if (/^\(none( captured)?\)$/i.test(normalized)) return true;
+        if (/^(invariants?|evolutions?)[:：]$/i.test(normalized)) return true;
+        if (/apply this session'?s deltas next run/i.test(normalized)) return true;
+        if (/investigate why embedded reflection generation failed/i.test(normalized)) return true;
+        return false;
+      };
+      const cleanSliceLines = (lines: string[]): string[] =>
+        lines
+          .map((line) => line.replace(/\*\*/g, "").trim())
+          .filter((line) => !isPlaceholderSlice(line));
+
       const invariantLines = parseSectionBullets(reflectionText, "Invariants & evolutions")
         .filter((line) => /invariant|stable|policy|rule/i.test(line))
         .slice(0, 8);
@@ -872,7 +889,10 @@ const memoryLanceDBProPlugin = {
         ? invariantLines
         : parseSectionBullets(reflectionText, "Decisions (durable)").slice(0, 6);
       const derived = [...evolutionLines, ...openLoopLines].slice(0, 10);
-      return { invariants, derived };
+      return {
+        invariants: cleanSliceLines(invariants).slice(0, 8),
+        derived: cleanSliceLines(derived).slice(0, 10),
+      };
     };
 
     const parseMemoryMetadata = (metadataRaw: string | undefined): Record<string, unknown> => {
@@ -894,6 +914,7 @@ const memoryLanceDBProPlugin = {
       scope: string;
       toolErrorSignals: ReflectionErrorSignal[];
       runAt: number;
+      usedFallback: boolean;
     }) => {
       const slices = extractReflectionSlices(params.reflectionText);
       const payload = [
@@ -933,6 +954,7 @@ const memoryLanceDBProPlugin = {
           storedAt: params.runAt,
           invariants: slices.invariants,
           derived: slices.derived,
+          usedFallback: params.usedFallback,
           errorSignals: params.toolErrorSignals.map((s) => s.signatureHash),
         }),
       });
@@ -944,6 +966,7 @@ const memoryLanceDBProPlugin = {
       const cached = reflectionByAgentCache.get(cacheKey);
       if (cached && Date.now() - cached.updatedAt < 15_000) return cached;
 
+      const now = Date.now();
       const entries = await store.list(scopeFilter, undefined, 120, 0);
       const reflections = entries
         .map((entry) => ({ entry, metadata: parseMemoryMetadata(entry.metadata) }))
@@ -952,16 +975,26 @@ const memoryLanceDBProPlugin = {
         )
         .sort((a, b) => b.entry.timestamp - a.entry.timestamp)
         .slice(0, 6);
+      const recentReflections = reflections.filter(
+        ({ entry }) => now - entry.timestamp <= DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS
+      );
 
       const invariants: string[] = [];
       const derived: string[] = [];
-      for (const { metadata } of reflections) {
+      for (const { metadata } of recentReflections) {
         const inv = Array.isArray(metadata.invariants) ? metadata.invariants.map((x) => String(x)) : [];
-        const der = Array.isArray(metadata.derived) ? metadata.derived.map((x) => String(x)) : [];
         for (const item of inv) {
           if (item && !invariants.includes(item)) invariants.push(item);
           if (invariants.length >= 8) break;
         }
+      }
+
+      // Derived focus should come from the latest recent non-fallback reflection only.
+      const latestForDerived = recentReflections.find(({ metadata }) => metadata.usedFallback !== true);
+      if (latestForDerived) {
+        const der = Array.isArray(latestForDerived.metadata.derived)
+          ? latestForDerived.metadata.derived.map((x) => String(x))
+          : [];
         for (const item of der) {
           if (item && !derived.includes(item)) derived.push(item);
           if (derived.length >= 10) break;
@@ -1489,6 +1522,12 @@ const memoryLanceDBProPlugin = {
             toolErrorSignals,
           });
           const reflectionText = reflectionGenerated.text;
+          if (reflectionGenerated.usedFallback) {
+            api.logger.warn(
+              `memory-reflection: fallback used for session ${currentSessionId}` +
+              (reflectionGenerated.error ? ` (${reflectionGenerated.error})` : "")
+            );
+          }
 
           const outDir = join(workspaceDir, "memory", "reflections", dateStr);
           await mkdir(outDir, { recursive: true });
@@ -1507,7 +1546,7 @@ const memoryLanceDBProPlugin = {
 
           await writeFile(outPath, `${header}${reflectionText.trim()}\n`, "utf-8");
 
-          if (reflectionStoreToLanceDB) {
+          if (reflectionStoreToLanceDB && !reflectionGenerated.usedFallback) {
             const stored = await storeReflectionToLanceDB({
               reflectionText,
               sessionKey,
@@ -1517,6 +1556,7 @@ const memoryLanceDBProPlugin = {
               scope: targetScope,
               toolErrorSignals,
               runAt: nowTs,
+              usedFallback: reflectionGenerated.usedFallback,
             });
             if (sessionKey && stored.slices.derived.length > 0) {
               reflectionDerivedBySession.set(sessionKey, {
@@ -1527,6 +1567,8 @@ const memoryLanceDBProPlugin = {
             for (const cacheKey of reflectionByAgentCache.keys()) {
               if (cacheKey.startsWith(`${sourceAgentId}::`)) reflectionByAgentCache.delete(cacheKey);
             }
+          } else if (sessionKey && reflectionGenerated.usedFallback) {
+            reflectionDerivedBySession.delete(sessionKey);
           }
 
           const dailyPath = join(workspaceDir, "memory", `${dateStr}.md`);

@@ -25,6 +25,7 @@ import type { MdMirrorWriter } from "./src/tools.js";
 import { shouldSkipRetrieval } from "./src/adaptive-retrieval.js";
 import { AccessTracker } from "./src/access-tracker.js";
 import { runWithReflectionTransientRetryOnce } from "./src/reflection-retry.js";
+import { resolveReflectionSessionSearchDirs, stripResetSuffix } from "./src/session-recovery.js";
 import { createMemoryCLI } from "./cli.js";
 
 // ============================================================================
@@ -696,11 +697,16 @@ function buildReflectionPrompt(
     "## Learning governance candidates (.learnings / promotion / skill extraction)",
     "## Open loops / next actions",
     "## Retrieval tags / keywords",
-    "## Invariants & Reflections",
+    "## Invariants",
+    "## Derived",
     "",
-    "Guidance for the final section (keep it short):",
-    "- Invariants = stable rules/policies that should persist across sessions.",
-    "- Reflections = concise executable deltas (reflect/inherit/derive/change/apply) for the next run.",
+    "Guidance for the final two sections (keep them short):",
+    "- Invariants = stable cross-session rules only. Each bullet must read like a rule/policy, not a diary note.",
+    "- Write invariants in executable rule form, such as: Always / Never / When X, do Y / Prefer / Avoid / Require.",
+    "- Do NOT put one-off observations, temporary follow-ups, or vague reflections in Invariants.",
+    "- Derived = latest-run deltas only. Keep only changes exposed by THIS run that should influence the NEXT run.",
+    "- Write derived bullets as concrete next-run adjustments, such as: This run showed ... / Next run ... / Re-check ... / Avoid repeating ...",
+    "- Do NOT restate long-term rules in Derived.",
     "",
     "For 'Learning governance candidates', prefer this structure:",
     "- LRN candidate(s): correction / best_practice / knowledge_gap",
@@ -745,9 +751,11 @@ function buildReflectionFallbackText(): string {
     "## Retrieval tags / keywords",
     "- memory-reflection",
     "",
-    "## Invariants & Reflections",
-    "- Invariants: keep durable rules stable.",
-    "- Reflections: apply this session's distilled changes next run.",
+    "## Invariants",
+    "- (none captured)",
+    "",
+    "## Derived",
+    "- Investigate why embedded reflection generation failed before trusting any next-run delta.",
   ].join("\n");
 }
 
@@ -990,11 +998,6 @@ function sanitizeForContext(text: string): string {
 // ============================================================================
 // Session Path Helpers
 // ============================================================================
-
-function stripResetSuffix(fileName: string): string {
-  const resetIndex = fileName.indexOf(".reset.");
-  return resetIndex === -1 ? fileName : fileName.slice(0, resetIndex);
-}
 
 async function sortFileNamesByMtimeDesc(dir: string, fileNames: string[]): Promise<string[]> {
   const candidates = await Promise.all(
@@ -1331,33 +1334,58 @@ const memoryLanceDBProPlugin = {
         const normalized = line.replace(/\*\*/g, "").trim();
         if (!normalized) return true;
         if (/^\(none( captured)?\)$/i.test(normalized)) return true;
-        if (/^(invariants?|reflections?)[:：]$/i.test(normalized)) return true;
+        if (/^(invariants?|reflections?|derived)[:：]$/i.test(normalized)) return true;
         if (/apply this session'?s deltas next run/i.test(normalized)) return true;
         if (/apply this session'?s distilled changes next run/i.test(normalized)) return true;
         if (/investigate why embedded reflection generation failed/i.test(normalized)) return true;
         return false;
       };
+      const normalizeSliceLine = (line: string): string =>
+        line
+          .replace(/\*\*/g, "")
+          .replace(/^(invariants?|reflections?|derived)[:：]\s*/i, "")
+          .trim();
       const cleanSliceLines = (lines: string[]): string[] =>
         lines
-          .map((line) => line.replace(/\*\*/g, "").trim())
+          .map(normalizeSliceLine)
           .filter((line) => !isPlaceholderSlice(line));
+      const isInvariantRuleLike = (line: string): boolean =>
+        /^(always|never|when\b|if\b|before\b|after\b|prefer\b|avoid\b|require\b|only\b|do not\b|must\b|should\b)/i.test(line) ||
+        /\b(must|should|never|always|prefer|avoid|required?)\b/i.test(line);
+      const isDerivedDeltaLike = (line: string): boolean =>
+        /^(this run|next run|going forward|follow-up|re-check|retest|verify|confirm|avoid repeating|adjust|change|update|retry|keep|watch)\b/i.test(line) ||
+        /\b(this run|next run|delta|change|adjust|retry|re-check|retest|verify|confirm|avoid repeating|follow-up)\b/i.test(line);
+      const isOpenLoopAction = (line: string): boolean =>
+        /^(investigate|verify|confirm|re-check|retest|update|add|remove|fix|avoid|keep|watch|document)\b/i.test(line);
 
+      const invariantSection = parseSectionBullets(reflectionText, "Invariants");
+      const derivedSection = parseSectionBullets(reflectionText, "Derived");
       const mergedSection = parseSectionBullets(reflectionText, "Invariants & Reflections");
 
-      const invariantLines = mergedSection
-        .filter((line) => /invariant|stable|policy|rule/i.test(line))
-        .slice(0, 8);
-      const reflectionLines = mergedSection
-        .filter((line) => /reflect|inherit|derive|change|apply/i.test(line))
-        .slice(0, 8);
-      const openLoopLines = parseSectionBullets(reflectionText, "Open loops / next actions").slice(0, 8);
-      const invariants = invariantLines.length > 0
-        ? invariantLines
-        : parseSectionBullets(reflectionText, "Decisions (durable)").slice(0, 6);
-      const derived = [...reflectionLines, ...openLoopLines].slice(0, 10);
+      const invariantsPrimary = cleanSliceLines(invariantSection).filter(isInvariantRuleLike);
+      const derivedPrimary = cleanSliceLines(derivedSection).filter(isDerivedDeltaLike);
+
+      const invariantLinesLegacy = cleanSliceLines(
+        mergedSection.filter((line) => /invariant|stable|policy|rule/i.test(line))
+      ).filter(isInvariantRuleLike);
+      const reflectionLinesLegacy = cleanSliceLines(
+        mergedSection.filter((line) => /reflect|inherit|derive|change|apply/i.test(line))
+      ).filter(isDerivedDeltaLike);
+      const openLoopLines = cleanSliceLines(parseSectionBullets(reflectionText, "Open loops / next actions"))
+        .filter(isOpenLoopAction)
+        .filter(isDerivedDeltaLike);
+      const durableDecisionLines = cleanSliceLines(parseSectionBullets(reflectionText, "Decisions (durable)"))
+        .filter(isInvariantRuleLike);
+
+      const invariants = invariantsPrimary.length > 0
+        ? invariantsPrimary
+        : (invariantLinesLegacy.length > 0 ? invariantLinesLegacy : durableDecisionLines);
+      const derived = derivedPrimary.length > 0
+        ? derivedPrimary
+        : [...reflectionLinesLegacy, ...openLoopLines];
       return {
-        invariants: cleanSliceLines(invariants).slice(0, 8),
-        derived: cleanSliceLines(derived).slice(0, 10),
+        invariants: invariants.slice(0, 8),
+        derived: derived.slice(0, 10),
       };
     };
 
@@ -1457,8 +1485,12 @@ const memoryLanceDBProPlugin = {
         }
       }
 
-      // Derived focus should come from the latest recent non-fallback reflection only.
-      const latestForDerived = recentReflections.find(({ metadata }) => metadata.usedFallback !== true);
+      // Derived focus should come from the latest recent non-fallback reflection with actual delta lines.
+      const latestForDerived = recentReflections.find(({ metadata }) =>
+        metadata.usedFallback !== true &&
+        Array.isArray(metadata.derived) &&
+        metadata.derived.some((x: unknown) => typeof x === "string" && x.trim().length > 0 && !/^\(none/i.test(x.trim()))
+      );
       if (latestForDerived) {
         const der = Array.isArray(latestForDerived.metadata.derived)
           ? latestForDerived.metadata.derived.map((x) => String(x))
@@ -1981,12 +2013,16 @@ const memoryLanceDBProPlugin = {
           const sessionEntry = (context.previousSessionEntry || context.sessionEntry || {}) as Record<string, unknown>;
           const currentSessionId = typeof sessionEntry.sessionId === "string" ? sessionEntry.sessionId : "unknown";
           let currentSessionFile = typeof sessionEntry.sessionFile === "string" ? sessionEntry.sessionFile : undefined;
+          const sourceAgentId = parseAgentIdFromSessionKey(sessionKey) || "main";
 
           if (!currentSessionFile || currentSessionFile.includes(".reset.")) {
-            const searchDirs = new Set<string>();
-            if (currentSessionFile) searchDirs.add(dirname(currentSessionFile));
-            searchDirs.add(join(workspaceDir, "sessions"));
-
+            const searchDirs = resolveReflectionSessionSearchDirs({
+              context,
+              cfg,
+              workspaceDir,
+              currentSessionFile,
+              sourceAgentId,
+            });
             for (const sessionsDir of searchDirs) {
               const recovered = await findPreviousSessionFile(sessionsDir, currentSessionFile, currentSessionId);
               if (recovered) {
@@ -2007,7 +2043,6 @@ const memoryLanceDBProPlugin = {
           const timeIso = now.toISOString().split("T")[1].replace("Z", "");
           const timeHms = timeIso.split(".")[0];
           const timeCompact = timeIso.replace(/[:.]/g, "");
-          const sourceAgentId = parseAgentIdFromSessionKey(sessionKey) || "main";
           const reflectionRunAgentId = resolveReflectionRunAgentId(cfg, sourceAgentId);
           const targetScope = scopeManager.getDefaultScope(sourceAgentId);
           const toolErrorSignals = sessionKey
